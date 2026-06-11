@@ -1,0 +1,39 @@
+﻿name: vdt
+services:
+  backend:
+    build:
+      context: ../backend
+    env_file:
+      - path: ../backend/.env
+        required: false
+    environment:
+      GRAPHDB_URL: http://graphdb:7200
+      FRONTEND_ORIGIN: http://localhost:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      - graphdb
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  graphdb:
+    image: ontotext/graphdb:10.8.4
+    ports:
+      - "7200:7200"
+    volumes:
+      - graphdb-data:/opt/graphdb/home
+      - ../Ontology:/opt/graphdb/home/graphdb-import:ro
+    restart: unless-stopped
+
+volumes:
+  graphdb-data:
