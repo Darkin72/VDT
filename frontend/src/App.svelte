@@ -4,7 +4,7 @@
     content: string
   }
 
-  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8090'
 
   let input = $state('')
   let isSending = $state(false)

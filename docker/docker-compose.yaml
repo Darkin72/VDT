@@ -8,9 +8,9 @@ services:
         required: false
     environment:
       GRAPHDB_URL: http://graphdb:7200
-      FRONTEND_ORIGIN: http://localhost:5173
+      FRONTEND_ORIGIN: http://localhost:5200
     ports:
-      - "8000:8000"
+      - "8090:8000"
     depends_on:
       - graphdb
     restart: unless-stopped
@@ -19,9 +19,9 @@ services:
     build:
       context: ../frontend
     environment:
-      VITE_API_BASE_URL: http://localhost:8000
+      VITE_API_BASE_URL: http://localhost:8090
     ports:
-      - "5173:5173"
+      - "5200:5173"
     depends_on:
       - backend
     restart: unless-stopped

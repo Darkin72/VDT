@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Benchmark backend chatbot bằng bộ câu hỏi trắc nghiệm trong Excel.
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import sys
 import time
@@ -21,10 +22,11 @@ from typing import Iterable
 
 import openpyxl
 import requests
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_XLSX = REPO_ROOT / "Ontology" / "test_questions_v1.0.xlsx"
-DEFAULT_BACKEND_URL = "http://localhost:8000/api/chat"
+DEFAULT_BACKEND_URL = "http://localhost:8090/api/chat"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "bench" / "results"
 
 
@@ -46,6 +48,7 @@ class BenchmarkResult:
     correct_answer: int
     predicted_answer: int | None
     is_correct: bool
+    has_db_evidence: bool
     valid_answer_count: int
     raw_response: str
     error: str
@@ -136,6 +139,7 @@ def build_prompt(case: QuestionCase) -> str:
         f"Giá trị answer hợp lệ là chuỗi từ \"1\" đến \"{len(case.options)}\".\n\n"
         f"Câu hỏi: {case.question}\n\n"
         f"Các đáp án:\n{options_text}\n\n"
+        "If SPARQL/GraphDB evidence is available, choose the option supported by that evidence and return {\"answer\":\"1\",\"evidence\":[\"short evidence\"]}; only guess the most likely option when no usable SPARQL evidence exists.\n"
         "JSON:"
     )
 
@@ -159,7 +163,7 @@ def call_backend(backend_url: str, prompt: str, timeout: float, echo_stream: boo
         return "".join(chunks).strip()
 
 
-def extract_answer(raw_response: str, valid_answer_count: int) -> int | None:
+def extract_response_json(raw_response: str) -> dict[str, object]:
     text = raw_response.strip()
     json_text = text
 
@@ -173,19 +177,98 @@ def extract_answer(raw_response: str, valid_answer_count: int) -> int | None:
 
     try:
         data = json.loads(json_text)
-        if isinstance(data, dict):
-            answer_value = str(data.get("answer", "")).strip()
-            if re.fullmatch(r"[1-5]", answer_value):
-                value = int(answer_value)
-                return value if 1 <= value <= valid_answer_count else None
+        return data if isinstance(data, dict) else {}
     except json.JSONDecodeError:
-        pass
+        return {}
+
+
+def extract_answer(raw_response: str, valid_answer_count: int) -> int | None:
+    text = raw_response.strip()
+    data = extract_response_json(raw_response)
+    if data:
+        answer_value = str(data.get("answer", "")).strip()
+        if re.fullmatch(r"[1-5]", answer_value):
+            value = int(answer_value)
+            return value if 1 <= value <= valid_answer_count else None
 
     candidates = [int(value) for value in re.findall(r"(?<!\d)([1-5])(?!\d)", text)]
     for value in candidates:
         if 1 <= value <= valid_answer_count:
             return value
     return None
+
+
+def has_db_evidence(raw_response: str) -> bool:
+    data = extract_response_json(raw_response)
+    evidence = data.get("evidence") if data else None
+    if not isinstance(evidence, list):
+        return False
+
+    evidence_text = "\n".join(str(item) for item in evidence).lower()
+    fallback_markers = (
+        "no usable sparql evidence",
+        "best-effort guess",
+        "fallback",
+        "no_graphdb_result",
+        "graphdb_error",
+        "graphdb_timeout",
+    )
+    if any(marker in evidence_text for marker in fallback_markers):
+        return False
+    return bool(evidence_text.strip())
+
+
+def run_single_case(
+    index: int,
+    case: QuestionCase,
+    backend_url: str,
+    timeout: float,
+    fail_fast: bool,
+    echo_stream: bool,
+) -> tuple[int, BenchmarkResult]:
+    prompt = build_prompt(case)
+    started_at = time.perf_counter()
+    raw_response = ""
+    error = ""
+    predicted_answer: int | None = None
+
+    try:
+        if echo_stream:
+            print(f"    Model stream [{index}]: ", end="", flush=True)
+        raw_response = call_backend(backend_url, prompt, timeout, echo_stream=echo_stream)
+        predicted_answer = extract_answer(raw_response, len(case.options))
+    except Exception as exc:  # Ghi lỗi để benchmark tiếp tục chạy được.
+        error = str(exc)
+        if fail_fast:
+            raise
+    finally:
+        latency = time.perf_counter() - started_at
+
+    is_correct = predicted_answer == case.answer
+    return index, BenchmarkResult(
+        question_id=case.question_id,
+        question_type=case.question_type,
+        question=case.question,
+        correct_answer=case.answer,
+        predicted_answer=predicted_answer,
+        is_correct=is_correct,
+        has_db_evidence=has_db_evidence(raw_response),
+        valid_answer_count=len(case.options),
+        raw_response=raw_response,
+        error=error,
+        latency_seconds=latency,
+    )
+
+
+def print_case_result(index: int, case: QuestionCase, result: BenchmarkResult) -> None:
+    status = "ĐÚNG" if result.is_correct else "SAI"
+    predicted_text = "Không trích được" if result.predicted_answer is None else str(result.predicted_answer)
+    print(
+        f"[{index}] ID={case.question_id} {status} | đúng={case.answer} | "
+        f"model={predicted_text} | {result.latency_seconds:.2f}s"
+    )
+    if result.error:
+        print(f"    Lỗi: {result.error}")
 
 
 def run_benchmark(
@@ -195,57 +278,48 @@ def run_benchmark(
     delay: float,
     fail_fast: bool,
     echo_stream: bool,
+    concurrency: int,
 ) -> list[BenchmarkResult]:
-    results: list[BenchmarkResult] = []
+    indexed_cases = list(enumerate(cases, start=1))
+    if concurrency <= 1:
+        results: list[BenchmarkResult] = []
+        progress = tqdm(indexed_cases, total=len(indexed_cases), desc="Benchmark", unit="q")
+        for index, case in progress:
+            _, result = run_single_case(index, case, backend_url, timeout, fail_fast, echo_stream)
+            results.append(result)
+            print_case_result(index, case, result)
+            if delay > 0:
+                time.sleep(delay)
+        return results
 
-    for index, case in enumerate(cases, start=1):
-        prompt = build_prompt(case)
-        started_at = time.perf_counter()
-        raw_response = ""
-        error = ""
-        predicted_answer: int | None = None
+    if echo_stream:
+        print("Tắt stream echo vì đang chạy song song để tránh trộn output.")
+        echo_stream = False
 
-        try:
-            if echo_stream:
-                print(f"    Model stream: ", end="", flush=True)
-            raw_response = call_backend(backend_url, prompt, timeout, echo_stream=echo_stream)
-            predicted_answer = extract_answer(raw_response, len(case.options))
-        except Exception as exc:  # Ghi lỗi để benchmark tiếp tục chạy được.
-            error = str(exc)
-            if fail_fast:
-                raise
-        finally:
-            latency = time.perf_counter() - started_at
-
-        is_correct = predicted_answer == case.answer
-        results.append(
-            BenchmarkResult(
-                question_id=case.question_id,
-                question_type=case.question_type,
-                question=case.question,
-                correct_answer=case.answer,
-                predicted_answer=predicted_answer,
-                is_correct=is_correct,
-                valid_answer_count=len(case.options),
-                raw_response=raw_response,
-                error=error,
-                latency_seconds=latency,
+    results_by_index: dict[int, BenchmarkResult] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_case = {}
+        for index, case in indexed_cases:
+            if delay > 0 and index > 1:
+                time.sleep(delay)
+            future = executor.submit(
+                run_single_case,
+                index,
+                case,
+                backend_url,
+                timeout,
+                fail_fast,
+                echo_stream,
             )
-        )
+            future_to_case[future] = (index, case)
 
-        status = "ĐÚNG" if is_correct else "SAI"
-        predicted_text = "Không trích được" if predicted_answer is None else str(predicted_answer)
-        print(
-            f"[{index}] ID={case.question_id} {status} | đúng={case.answer} | "
-            f"model={predicted_text} | {latency:.2f}s"
-        )
-        if error:
-            print(f"    Lỗi: {error}")
+        for future in tqdm(as_completed(future_to_case), total=len(future_to_case), desc="Benchmark", unit="q"):
+            index, case = future_to_case[future]
+            completed_index, result = future.result()
+            results_by_index[completed_index] = result
+            print_case_result(completed_index, case, result)
 
-        if delay > 0:
-            time.sleep(delay)
-
-    return results
+    return [results_by_index[index] for index, _ in indexed_cases]
 
 
 def summarize(results: list[BenchmarkResult]) -> dict[str, object]:
@@ -253,6 +327,7 @@ def summarize(results: list[BenchmarkResult]) -> dict[str, object]:
     correct = sum(1 for result in results if result.is_correct)
     errored = sum(1 for result in results if result.error)
     unparsed = sum(1 for result in results if result.predicted_answer is None and not result.error)
+    db_evidence_count = sum(1 for result in results if result.has_db_evidence)
     accuracy = correct / total if total else 0.0
 
     by_type: dict[str, dict[str, object]] = {}
@@ -271,6 +346,8 @@ def summarize(results: list[BenchmarkResult]) -> dict[str, object]:
         "incorrect": total - correct,
         "errored": errored,
         "unparsed": unparsed,
+        "db_evidence_count": db_evidence_count,
+        "db_evidence_rate": db_evidence_count / total if total else 0.0,
         "accuracy": accuracy,
         "by_type": by_type,
     }
@@ -292,6 +369,7 @@ def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], ou
                 "correct_answer",
                 "predicted_answer",
                 "is_correct",
+                "has_db_evidence",
                 "valid_answer_count",
                 "latency_seconds",
                 "error",
@@ -308,6 +386,7 @@ def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], ou
                     "correct_answer": result.correct_answer,
                     "predicted_answer": result.predicted_answer or "",
                     "is_correct": result.is_correct,
+                    "has_db_evidence": result.has_db_evidence,
                     "valid_answer_count": result.valid_answer_count,
                     "latency_seconds": round(result.latency_seconds, 4),
                     "error": result.error,
@@ -327,8 +406,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL, help="Endpoint backend /api/chat")
     parser.add_argument("--limit", type=int, default=0, help="Giới hạn số câu hỏi, 0 là chạy toàn bộ")
     parser.add_argument("--offset", type=int, default=0, help="Bỏ qua N câu hỏi đầu tiên")
-    parser.add_argument("--timeout", type=float, default=120.0, help="Timeout đọc stream cho mỗi câu, tính bằng giây")
-    parser.add_argument("--delay", type=float, default=0.0, help="Nghỉ giữa các request, tính bằng giây")
+    parser.add_argument("--timeout", type=float, default=600.0, help="Timeout đọc stream cho mỗi câu, tính bằng giây")
+    parser.add_argument("--delay", type=float, default=0.0, help="Nghỉ giữa các request submit, tính bằng giây")
+    parser.add_argument("--concurrency", type=int, default=5, help="Số câu benchmark chạy song song")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Thư mục ghi kết quả")
     parser.add_argument("--fail-fast", action="store_true", help="Dừng ngay khi request đầu tiên bị lỗi")
     parser.add_argument(
@@ -358,6 +438,7 @@ def main() -> int:
     print(f"Đang benchmark {len(cases)} câu hỏi")
     print(f"Backend: {args.backend_url}")
     print(f"Excel: {args.xlsx}")
+    print(f"Concurrency: {max(1, args.concurrency)}")
 
     results = run_benchmark(
         cases=cases,
@@ -366,6 +447,7 @@ def main() -> int:
         delay=args.delay,
         fail_fast=args.fail_fast,
         echo_stream=not args.no_stream_echo,
+        concurrency=max(1, args.concurrency),
     )
     summary = summarize(results)
     csv_path, json_path = write_outputs(results, summary, args.output_dir)
@@ -376,6 +458,7 @@ def main() -> int:
     print(f"- Sai: {summary['incorrect']}")
     print(f"- Lỗi request: {summary['errored']}")
     print(f"- Không trích được đáp án: {summary['unparsed']}")
+    print(f"- DB evidence extracted: {summary['db_evidence_count']} ({summary['db_evidence_rate']:.2%})")
     print(f"- Accuracy: {summary['accuracy']:.2%}")
     print(f"- File CSV: {csv_path}")
     print(f"- File JSON: {json_path}")
@@ -384,12 +467,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
 
 

@@ -1,6 +1,6 @@
-﻿# Benchmark backend
+# Benchmark backend
 
-Script `benchmark_backend.py` đọc bộ câu hỏi trong `Ontology/test_questions_v1.0.xlsx`, gọi backend `/api/chat`, stream câu trả lời của model ra màn hình theo từng câu, trích JSON model trả về theo dạng `{ "answer": "1" }`, rồi tự động chấm accuracy.
+Script `benchmark_backend.py` đọc bộ câu hỏi trong `Ontology/test_questions_v1.0.xlsx`, gọi backend `/api/chat`, mặc định chạy song song 5 câu một lượt, hiển thị tiến độ bằng `tqdm`, trích JSON model trả về theo dạng `{ "answer": "1" }`, rồi tự động chấm accuracy.
 
 ## Cài dependency
 
@@ -20,7 +20,13 @@ Chạy thử một vài câu:
 python bench/benchmark_backend.py --limit 10
 ```
 
-Mặc định script in stream câu trả lời của model ra màn hình. Nếu chỉ muốn chấm điểm và ghi file kết quả, tắt phần in stream:
+Mặc định chạy song song 5 câu một lượt. Có thể chỉnh số worker:
+
+```bash
+python bench/benchmark_backend.py --limit 10 --concurrency 5
+```
+
+Khi `--concurrency` lớn hơn 1, script tự tắt stream echo để tránh output các câu bị trộn. Khi chạy tuần tự, mặc định script in stream câu trả lời của model ra màn hình. Nếu chỉ muốn chấm điểm và ghi file kết quả, tắt phần in stream:
 
 ```bash
 python bench/benchmark_backend.py --limit 10 --no-stream-echo
