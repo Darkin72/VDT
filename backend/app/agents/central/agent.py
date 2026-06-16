@@ -5,7 +5,7 @@ from typing import Any
 from app import graphdb_service, llm_service, logging_service
 
 OPTIONS_BLOCK_PATTERN = re.compile(
-    r"(?is)(?:c[aá]c\s+)?(?:(?:đ|d)[aá]p\s*[aá]n|answer\s+options?|options?)\s*:?\s*\n?.*$"
+    "(?is)(?:c(?:a|\u00e1)c\\s+)?(?:(?:\u0111|d)(?:a|\u00e1)p\\s*(?:a|\u00e1)n|answer\\s+options?|options?)\\s*:?\\s*\\n?.*$"
 )
 NUMBERED_OPTION_PATTERN = re.compile(r"(?m)^\s*(?:[1-5]|[A-Ea-e])[\).:-]\s+.+$")
 
@@ -42,6 +42,72 @@ def strip_answer_options(text: str) -> str:
     stripped = OPTIONS_BLOCK_PATTERN.sub("", text).strip()
     stripped = NUMBERED_OPTION_PATTERN.sub("", stripped).strip()
     return stripped or text
+
+def build_history(original_prompt: str) -> dict[str, Any]:
+    return {"original_prompt": original_prompt, "steps": []}
+
+def add_history_step(history: dict[str, Any], step_type: str, payload: dict[str, Any]) -> None:
+    steps = history.setdefault("steps", [])
+    if isinstance(steps, list):
+        steps.append({"type": step_type, **payload})
+
+def history_to_text(history: dict[str, Any]) -> str:
+    return json.dumps(history, ensure_ascii=False, indent=2)
+
+def decide_next_action(
+    message: str,
+    history: dict[str, Any],
+    sparql_attempts: int,
+    max_sparql_attempts: int,
+) -> dict[str, Any]:
+    if sparql_attempts >= max_sparql_attempts:
+        decision = {
+            "action": "answer",
+            "query_description": "",
+            "reason": "max_sparql_attempts_reached",
+        }
+        logging_service.agent_step("central_agent.next_action", decision)
+        return decision
+
+    prompt = (
+        "You are the central control agent for a Vietnamese chatbot backed by GraphDB/DBpedia.\n"
+        "You can inspect the original user prompt and the full execution history.\n"
+        "Decide whether the available information is enough to answer, or whether one more neutral GraphDB lookup is needed.\n\n"
+        "Important rules:\n"
+        "- If history contains enough concrete evidence or enough failed attempts to make progress unlikely, choose action=answer.\n"
+        "- If one more lookup is useful, choose action=sparql and write a neutral query_description for the SPARQL coder.\n"
+        "- Do not include answer option IDs or answer choices in query_description.\n"
+        "- Avoid repeating failed or already-executed lookups from history.\n"
+        "- Return only valid JSON with this schema: "
+        "{\"action\":\"answer\",\"query_description\":\"\",\"reason\":\"short reason\"}.\n"
+        "- action must be either answer or sparql.\n\n"
+        f"SPARQL attempts used: {sparql_attempts}/{max_sparql_attempts}\n\n"
+        f"Original prompt:\n{message}\n\n"
+        f"Execution history:\n{history_to_text(history)}"
+    )
+    raw_text = llm_service.complete_text(
+        [
+            llm_service.system_message("You are a central control agent. Return only action JSON."),
+            llm_service.user_message(prompt),
+        ]
+    )
+    logging_service.verbose_text("central_agent.raw_next_action_response", raw_text)
+    data = extract_json_object(raw_text)
+    action = str(data.get("action", "answer")).strip().lower() if data else "answer"
+    if action not in {"answer", "sparql"}:
+        action = "answer"
+
+    query_description = strip_answer_options(str(data.get("query_description", "")).strip()) if data else ""
+    if action == "sparql" and not query_description:
+        action = "answer"
+
+    decision = {
+        "action": action,
+        "query_description": query_description if action == "sparql" else "",
+        "reason": str(data.get("reason", "")).strip() if data else "next_action_json_parse_failed",
+    }
+    logging_service.agent_step("central_agent.next_action", decision)
+    return decision
 
 
 def plan_graphdb_usage(message: str) -> dict[str, Any]:
@@ -88,18 +154,6 @@ def plan_graphdb_usage(message: str) -> dict[str, Any]:
     return decision
 
 
-def direct_answer_messages(message: str) -> list[llm_service.ChatMessage]:
-    return [
-        llm_service.system_message(
-            "You are a helpful Vietnamese chatbot. Answer clearly and concisely. "
-            "For multiple-choice prompts, return only valid JSON with this schema: "
-            "{\"answer\":\"1\",\"evidence\":[\"short evidence or fallback reason\"]}. "
-            "The answer value must be the selected option ID as a string."
-        ),
-        llm_service.user_message(message),
-    ]
-
-
 def is_multiple_choice_prompt(message: str) -> bool:
     return bool(NUMBERED_OPTION_PATTERN.search(message))
 
@@ -129,39 +183,3 @@ def normalize_answer_evidence_response(
             evidence = ["No usable SPARQL evidence; selected as a best-effort guess."]
 
     return json.dumps({"answer": answer, "evidence": evidence}, ensure_ascii=False)
-
-
-def final_answer_messages(
-    message: str,
-    decision: dict[str, Any],
-    sparql: str,
-    graphdb_result: dict[str, Any] | None,
-    graphdb_error: str | None = None,
-) -> list[llm_service.ChatMessage]:
-    if graphdb_result:
-        result_text = graphdb_service.format_result(graphdb_result)
-    elif graphdb_error:
-        result_text = graphdb_error
-    else:
-        result_text = "NO_GRAPHDB_RESULT"
-    return [
-        llm_service.system_message(
-            "You are the central answering agent for a Vietnamese chatbot. "
-            "For multiple-choice prompts, always return only valid JSON with this schema: "
-            "{\"answer\":\"1\",\"evidence\":[\"short evidence text\"]}. "
-            "The answer value must be the selected option ID as a string. "
-            "Evidence must be a JSON array of short strings. "
-            "If GraphDB rows are provided, compare those facts with the original choices and choose only the option supported by GraphDB evidence. "
-            "In that case, every evidence item must cite a concrete value, entity, relationship, date, count, or literal from the GraphDB result. "
-            "If GraphDB returned no result, no SPARQL was executed, or a timeout/error status is provided, then and only then choose the option that seems most likely from general knowledge. "
-            "For fallback answers, set evidence to a single item explaining that there was no usable SPARQL evidence and that the choice is a best-effort guess. "
-            "For non-multiple-choice prompts, answer clearly and include GraphDB evidence when available."
-        ),
-        llm_service.user_message(
-            f"Original prompt including any answer choices:\n{message}\n\n"
-            f"Central routing decision:\n{json.dumps(decision, ensure_ascii=False)}\n\n"
-            f"Executed SPARQL:\n{sparql or 'NO_SPARQL_EXECUTED'}\n\n"
-            f"GraphDB result:\n{result_text}\n\n"
-            "Return the final answer to the user."
-        ),
-    ]

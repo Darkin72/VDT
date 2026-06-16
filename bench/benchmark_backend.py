@@ -406,7 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL, help="Endpoint backend /api/chat")
     parser.add_argument("--limit", type=int, default=0, help="Giới hạn số câu hỏi, 0 là chạy toàn bộ")
     parser.add_argument("--offset", type=int, default=0, help="Bỏ qua N câu hỏi đầu tiên")
-    parser.add_argument("--timeout", type=float, default=600.0, help="Timeout đọc stream cho mỗi câu, tính bằng giây")
+    parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout đọc stream cho mỗi câu, tính bằng giây")
     parser.add_argument("--delay", type=float, default=0.0, help="Nghỉ giữa các request submit, tính bằng giây")
     parser.add_argument("--concurrency", type=int, default=5, help="Số câu benchmark chạy song song")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Thư mục ghi kết quả")

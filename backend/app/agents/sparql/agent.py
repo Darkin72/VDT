@@ -2,7 +2,7 @@ import re
 from typing import Any
 
 from app import llm_service, logging_service
-from app.central_agent import extract_json_object
+from app.agents.central import extract_json_object
 
 READ_ONLY_SPARQL_PATTERN = re.compile(
     r"\b(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|MOVE|COPY|ADD|SERVICE)\b",

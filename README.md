@@ -36,11 +36,19 @@ CHAT_API_KEY=your_api_key_here
 CHAT_API_AUTH_HEADER=Authorization
 CHAT_API_AUTH_PREFIX=Bearer
 CHAT_MODEL=your-model-name
+CHAT_API_CONNECT_TIMEOUT_SECONDS=10
+CHAT_API_READ_TIMEOUT_SECONDS=120
+CHAT_API_MAX_RETRIES=2
+CHAT_API_RETRY_BACKOFF_SECONDS=1
 GRAPHDB_REPOSITORY=vdt
-GRAPHDB_QUERY_TIMEOUT_SECONDS=150
+GRAPHDB_QUERY_TIMEOUT_SECONDS=200
+QUESTION_TIMEOUT_SECONDS=1200
+QUESTION_FINALIZATION_RESERVE_SECONDS=240
 ```
 
-The backend uses a two-agent flow. GraphDB query timeout defaults to 150 seconds. The central agent first decides whether GraphDB is needed and writes a precise query description. If lookup is needed, the SPARQL coder agent turns that description into a read-only SELECT or ASK query. The backend executes the query, sends the GraphDB result back to the central agent, and the central agent writes the final answer. If GraphDB is not needed, or if lookup fails/returns no rows, the central agent can answer without GraphDB.
+The backend uses a two-agent flow. GraphDB query timeout has a configurable cap of 200 seconds per query, but each query is capped dynamically by the remaining `QUESTION_TIMEOUT_SECONDS` budget. With the default `QUESTION_TIMEOUT_SECONDS=1200`, `MAX_SPARQL_ATTEMPTS=5`, and `QUESTION_FINALIZATION_RESERVE_SECONDS=240`, the first GraphDB timeout is capped at 192s in the worst case of 5 possible queries: `(1200 - 240) / 5`. Later queries are recalculated from the remaining time. The central agent first decides whether GraphDB is needed and writes a precise query description. If lookup is needed, the SPARQL coder agent turns that description into a read-only SELECT or ASK query. The backend executes the query, sends the GraphDB result back to the central agent, and the central agent writes the final answer. If GraphDB is not needed, times out, or returns no rows, the central agent can answer without GraphDB.
+
+LLM calls retry transient connection failures, timeouts, and HTTP `429/5xx` responses before any stream chunk is emitted. By default the backend tries the initial call plus 2 retries, with a 1-second linear backoff.
 
 The model API request uses an OpenAI-compatible chat-completions streaming format, but it does not use the OpenAI SDK. Browser-like headers are sent by default: `User-Agent`, `Accept`, `Accept-Language`, `Origin`, `Referer`, `Sec-Fetch-*`, and `sec-ch-ua*`. If the API requires custom headers, add JSON to:
 

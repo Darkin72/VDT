@@ -37,9 +37,31 @@ def build_repository_url() -> str:
     return f"{graphdb_url}/repositories/{repository}"
 
 
-def query(sparql: str) -> dict[str, Any]:
+def configured_query_timeout_seconds() -> int:
+    return int(os.getenv("GRAPHDB_QUERY_TIMEOUT_SECONDS", "200"))
+
+
+def effective_query_timeout_seconds(
+    *,
+    remaining_question_seconds: float | None = None,
+    remaining_graphdb_queries: int = 1,
+) -> int:
+    configured_timeout = configured_query_timeout_seconds()
+    if remaining_question_seconds is None:
+        return configured_timeout
+
+    finalization_reserve = int(os.getenv("QUESTION_FINALIZATION_RESERVE_SECONDS", "240"))
+    usable_seconds = int(remaining_question_seconds) - finalization_reserve
+    if usable_seconds <= 0:
+        return 0
+
+    query_count = max(1, remaining_graphdb_queries)
+    return max(1, min(configured_timeout, usable_seconds // query_count))
+
+
+def query(sparql: str, *, timeout_seconds: int | None = None) -> dict[str, Any]:
     repository_url = build_repository_url()
-    timeout_seconds = int(os.getenv("GRAPHDB_QUERY_TIMEOUT_SECONDS", "150"))
+    timeout_seconds = timeout_seconds if timeout_seconds is not None else configured_query_timeout_seconds()
     logging_service.agent_step(
         "graphdb.query_start",
         {"repository_url": repository_url, "timeout_seconds": timeout_seconds, "sparql": sparql},
