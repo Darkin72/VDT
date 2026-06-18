@@ -30,10 +30,10 @@ def build_repository_url() -> str:
     if explicit_url:
         return explicit_url
 
-    graphdb_url = os.getenv("GRAPHDB_URL", "http://graphdb:7200").rstrip("/")
+    graphdb_url = os.getenv("GRAPHDB_URL", "http://157.10.53.238:21150").rstrip("/")
     repository = os.getenv("GRAPHDB_REPOSITORY", "").strip()
     if not repository:
-        repository = discover_repository(graphdb_url) or "vdt"
+        repository = discover_repository(graphdb_url) or "DBPEDIA"
     return f"{graphdb_url}/repositories/{repository}"
 
 

@@ -71,7 +71,7 @@
         <p class="eyebrow">VDT chatbot</p>
         <h1>Simple LangChain Chat</h1>
       </div>
-      <a class="graph-link" href="http://localhost:7200" target="_blank" rel="noreferrer">GraphDB</a>
+      <a class="graph-link" href="http://157.10.53.238:21150" target="_blank" rel="noreferrer">GraphDB</a>
     </header>
 
     <div class="messages" aria-live="polite">
@@ -95,4 +95,3 @@
     </form>
   </section>
 </main>
-

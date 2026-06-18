@@ -1,10 +1,11 @@
+import json
 import re
 import unicodedata
 from typing import Any
 
 from app import llm_service, logging_service
 from app.agents.central import extract_json_object
-from app.agents.central.agent import strip_answer_options
+from app.agents.central.agent import shorten_for_history, strip_answer_options
 from app.rag import ontology_retriever
 
 READ_ONLY_SPARQL_PATTERN = re.compile(
@@ -59,7 +60,9 @@ COMMON_PREFIXES = {
 
 PREFIX_DECLARATION_PATTERN = re.compile(r"(?im)^\s*PREFIX\s+([A-Za-z][\w-]*):")
 PREFIX_USAGE_PATTERN = re.compile(r"(?<![\w:/#])([A-Za-z][\w-]*):[A-Za-z_][\w.-]*")
-WORD_PATTERN = re.compile(r"[\wÀ-ỹĐđ.-]+", re.UNICODE)
+PREFIX_LINE_PATTERN = re.compile(r"(?im)^\s*PREFIX\s+[^\n]+\n?")
+LEADING_VALUES_PATTERN = re.compile(r"(?is)^\s*((?:VALUES\s+\?\w+\s*\{[^{}]*\}\s*)+)((?:SELECT|ASK)\b.*)$")
+WORD_PATTERN = re.compile(r"[^\W\d_][\w.-]*", re.UNICODE)
 STOP_RESOURCE_PHRASES = {"GraphDB", "DBpedia", "SPARQL", "JSON"}
 
 
@@ -79,17 +82,49 @@ def add_missing_common_prefixes(query: str) -> str:
     return f"{declarations}\n{query}"
 
 
+def move_leading_values_into_where(query: str) -> str:
+    prefix_lines = "".join(PREFIX_LINE_PATTERN.findall(query))
+    body = PREFIX_LINE_PATTERN.sub("", query).strip()
+    match = LEADING_VALUES_PATTERN.match(body)
+    if not match:
+        return query
+
+    leading_values = match.group(1).strip()
+    query_body = match.group(2).strip()
+    where_start = query_body.find("{")
+    if where_start < 0:
+        return query
+
+    indented_values = "\n".join(f"  {line}" for line in leading_values.splitlines())
+    return f"{prefix_lines}{query_body[:where_start + 1]}\n{indented_values}{query_body[where_start + 1:]}"
+
+
+def normalize_filter_logical_or(query: str) -> str:
+    return re.sub(r"(?i)(\s+)OR(\s+)", r"\1||\2", query)
+
+def normalize_escaped_sparql_whitespace(query: str) -> str:
+    return query.replace(r"\n", "\n").replace(r"\t", "\t")
+
+def ensure_select_limit(query: str, *, default_limit: int = 100) -> str:
+    body = PREFIX_LINE_PATTERN.sub("", query).strip()
+    if not body.upper().startswith("SELECT"):
+        return query
+    if re.search(r"(?is)\bLIMIT\s+\d+\s*$", query):
+        return query
+    return f"{query.rstrip()}\nLIMIT {default_limit}"
+
+
 def is_read_only_sparql(query: str) -> bool:
     if not query or READ_ONLY_SPARQL_PATTERN.search(query):
         return False
-    without_prefixes = re.sub(r"(?im)^\s*PREFIX\s+[^\n]+\n?", "", query).strip()
+    without_prefixes = PREFIX_LINE_PATTERN.sub("", query).strip()
     return without_prefixes.upper().startswith(("SELECT", "ASK"))
 
 
 def strip_diacritics(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text)
     stripped = "".join(character for character in normalized if unicodedata.category(character) != "Mn")
-    return stripped.replace("Đ", "D").replace("đ", "d")
+    return stripped.replace("Ã„Â", "D").replace("Ã„â€˜", "d")
 
 
 def resource_iri_name(text: str) -> str:
@@ -140,14 +175,60 @@ def possible_resource_block(user_prompt: str, query_description: str) -> str:
     return "\n".join(lines)
 
 
-def generate_sparql(user_prompt: str, query_description: str) -> str:
-    ontology_candidates_block = ontology_retriever.format_candidates_block(query_description)
+
+def previous_attempts_block(history: dict[str, Any] | None) -> str:
+    if not history:
+        return ""
+    steps = history.get("steps", [])
+    if not isinstance(steps, list):
+        return ""
+
+    attempts: list[dict[str, Any]] = []
+    for step in steps:
+        if isinstance(step, dict) and step.get("type") == "sparql_execution":
+            attempts.append(
+                {
+                    "attempt": step.get("attempt"),
+                    "query_description": shorten_for_history(step.get("query_description", "")),
+                    "sparql": shorten_for_history(step.get("sparql", "")),
+                    "result_summary": shorten_for_history(step.get("result_summary", "")),
+                    "error": shorten_for_history(step.get("error", "")),
+                }
+            )
+    if not attempts:
+        return ""
+
+    return (
+        "Previous SPARQL attempts in this same user request:\n"
+        f"{json.dumps(attempts[-4:], ensure_ascii=False, indent=2)}\n\n"
+        "Use this history directly: do not repeat failed query shapes, malformed VALUES blocks, broad DISTINCT label scans, "
+        "or queries that caused GraphDB memory errors. Prefer a narrower VALUES-based query when a retrieved resource candidate exists.\n\n"
+    )
+def format_ontology_candidates_block(candidates: list[dict[str, Any]]) -> str:
+    if not candidates:
+        return ""
+
+    lines = ["Retrieved ontology/resource URI candidates:"]
+    lines.extend(f"- {ontology_retriever.format_candidate(candidate)}" for candidate in candidates)
+    return "\n".join(lines)
+
+
+def generate_sparql(user_prompt: str, query_description: str, history: dict[str, Any] | None = None) -> str:
+    ontology_candidates = ontology_retriever.retrieve_candidates(query_description)
+    previous_attempts_prompt = previous_attempts_block(history)
+    ontology_candidates_block = format_ontology_candidates_block(ontology_candidates)
     resource_candidates_block = possible_resource_block(user_prompt, query_description)
     ontology_candidates_prompt = (
         f"{ontology_candidates_block}\n\n"
-        "Use these ontology URI candidates as schema hints only. "
-        "They are not guaranteed to be populated predicates in the local graph. "
-        "If predicate confidence is low, prefer a broad predicate scan from the correct subject instead of forcing a narrow candidate.\n\n"
+        "Use retrieved candidates as hints, not as final evidence. Candidates may include subject resources, "
+        "answer resources, classes, or predicates. First identify the likely subject resource from the user prompt. "
+        "Then choose a predicate candidate only when its CURIE, label, kind, domain/range, or surrounding context clearly matches the requested relation/attribute. "
+        "When a retrieved schema/property candidate is plausible, test it directly before inventing a hand-written list of common predicates. "
+        "Do not prefer a hand-written list such as parent/child/spouse/date/type/etc. over a retrieved candidate that semantically matches the request. "
+        "A dbo: schema candidate can represent a class or a predicate; verify its role by using it in a focused query when its label fits the requested relation/attribute. "
+        "Broad or generic predicate labels can still be valid in DBpedia; do not discard them only because they are not named like parent/spouse/date/etc. "
+        "A focused verification query should bind or use the candidate predicate and return distinct objects plus labels. "
+        "When predicate confidence is low, use a broad predicate scan from the correct subject and return predicate labels plus objects.\n\n"
         if ontology_candidates_block
         else ""
     )
@@ -156,16 +237,20 @@ def generate_sparql(user_prompt: str, query_description: str) -> str:
         "You are a SPARQL coder for the local GraphDB.\n"
         "Create one read-only SPARQL query from the central agent description.\n"
         "Only create SELECT or ASK. Do not use INSERT, DELETE, UPDATE, or SERVICE.\n"
+        "After PREFIX declarations, the query must start with SELECT or ASK. Put VALUES blocks inside WHERE { ... }, never before SELECT/ASK.\n"
         "Main priority for this phase: identify the correct subject and object resources. Predicate choice may be imperfect.\n"
         "Prefer returning neutral factual evidence: entities, relationships, labels, dates, counts, and literal values needed by the core question.\n"
         "For entity lookup, prefer exact dbr:Entity_Name candidates from the question before label search. Preserve Vietnamese diacritics in dbr: IRIs and also try ASCII-folded alternatives when provided.\n"
         "If exact resources are plausible, use VALUES for them and then query their predicates directly; do not make rdfs:label matching the only way to find the entity.\n"
+        "If retrieved candidates include both a likely subject resource and a likely schema/property for the requested relation or attribute, first create a focused query using those candidates; use broad scans only after that is unsuitable.\n"
+        "For relationship or attribute questions, a retrieved property candidate whose label literally matches the requested concept is stronger evidence than generic property names you remember from DBpedia.\n"
+        "For count questions, return distinct candidate rows and labels instead of only COUNT, so the answer agent can verify what was counted.\n"
         "When selecting resources, include labels/names when available using OPTIONAL rdfs:label or foaf:name. Do not require labels to exist.\n"
         "When the correct predicate is uncertain, use a broad pattern like ?subject ?predicate ?object with OPTIONAL predicate/object labels, and return enough rows for the central/answer agents to choose or count distinct objects.\n"
-        "For count questions, return candidate objects/resources and labels; do not over-filter with a hand-picked predicate list unless the predicate is highly certain.\n"
+        "Avoid SELECT DISTINCT for broad label scans; use SELECT with LIMIT instead to keep GraphDB memory usage low.\n"
         "For fallback lookup, search across rdfs:label, foaf:name, and dbo:alias, and avoid strict language filters unless the variable is optional evidence only.\n"
         "Do not include answer choices, option IDs, VALUES blocks for choices, or BINDs mapping choices to options. The central agent handles choices later.\n"
-        "SPARQL function syntax matters: use CONTAINS(LCASE(STR(?label)), \"text\"), never LCASE(STR(?label)) CONTAINS(\"text\").\n\n"
+        "SPARQL function syntax matters: use CONTAINS(LCASE(STR(?label)), \"text\"), never LCASE(STR(?label)) CONTAINS(\"text\"). Use || for logical OR; never use keyword OR inside FILTER expressions. If combining EXISTS with another boolean condition, put the whole expression inside one FILTER(...); never place || between graph patterns.\n\n"
         "Common prefixes:\n"
         "PREFIX dbo: <http://dbpedia.org/ontology/>\n"
         "PREFIX dbr: <http://dbpedia.org/resource/>\n"
@@ -191,7 +276,11 @@ def generate_sparql(user_prompt: str, query_description: str) -> str:
     logging_service.verbose_text("sparql_agent.raw_response", raw_text)
     data: dict[str, Any] = extract_json_object(raw_text)
     sparql = str(data.get("sparql", "")).strip() if data else ""
+    sparql = normalize_escaped_sparql_whitespace(sparql)
     sparql = add_missing_common_prefixes(sparql)
+    sparql = move_leading_values_into_where(sparql)
+    sparql = normalize_filter_logical_or(sparql)
+    sparql = ensure_select_limit(sparql)
     if not is_read_only_sparql(sparql):
         logging_service.agent_step("sparql_agent.rejected_sparql", {"sparql": sparql})
         return ""

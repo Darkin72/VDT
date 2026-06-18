@@ -1,15 +1,28 @@
 import os
 import uuid
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+except Exception:  # noqa: BLE001 - dotenv is optional for script use.
+    pass
+
+
+def running_in_container() -> bool:
+    return Path("/.dockerenv").exists() or os.getenv("RUNNING_IN_CONTAINER", "").strip().lower() in {"1", "true", "yes"}
 
 
 def qdrant_url() -> str:
-    return os.getenv("QDRANT_URL", "http://qdrant:6333").strip().rstrip("/")
+    default_url = "http://qdrant:6333" if running_in_container() else "http://localhost:6363"
+    return os.getenv("QDRANT_URL", default_url).strip().rstrip("/")
 
 
 def qdrant_collection() -> str:
-    return os.getenv("QDRANT_COLLECTION", "ontology_uri").strip() or "ontology_uri"
+    return os.getenv("QDRANT_COLLECTION", "ontology_benchmark_perfect").strip() or "ontology_benchmark_perfect"
 
 
 def point_id(uri: str) -> str:
@@ -59,4 +72,3 @@ def search(vector: list[float], *, limit: int) -> list[dict[str, Any]]:
         payload["score"] = float(hit.score)
         results.append(payload)
     return results
-

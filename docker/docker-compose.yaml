@@ -1,4 +1,4 @@
-﻿name: vdt
+name: vdt
 services:
   backend:
     build:
@@ -7,17 +7,29 @@ services:
       - path: ../backend/.env
         required: false
     environment:
-      GRAPHDB_URL: http://graphdb:7200
+      GRAPHDB_URL: http://157.10.53.238:21150
+      GRAPHDB_REPOSITORY: DBPEDIA
       FRONTEND_ORIGIN: http://localhost:5200
-      QDRANT_URL: http://qdrant:6333
       ONTOLOGY_SCHEMA_PATH: /app/Ontology/ontology--DEV_type=parsed_sorted.nt
+      ONTOLOGY_LOOKUP_DB_PATH: /app/Ontology/normalized/embedding_lookup.sqlite
+      ONTOLOGY_LOOKUP_DOCUMENTS_PATH: /app/Ontology/normalized/embedding_documents.jsonl
     volumes:
       - ../Ontology:/app/Ontology:ro
     ports:
       - "8090:8000"
-    depends_on:
-      - graphdb
-      - qdrant
+    restart: unless-stopped
+
+  ontology-lookup:
+    build:
+      context: ../backend
+    environment:
+      LOOKUP_DOCUMENTS_PATH: /app/Ontology/normalized/embedding_documents.jsonl
+      LOOKUP_DB_PATH: /app/Ontology/normalized/embedding_lookup.sqlite
+    volumes:
+      - ../Ontology:/app/Ontology:ro
+    ports:
+      - "8091:8001"
+    command: ["uvicorn", "app.lookup_service:app", "--host", "0.0.0.0", "--port", "8001"]
     restart: unless-stopped
 
   frontend:
@@ -30,24 +42,3 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
-
-  graphdb:
-    image: ontotext/graphdb:10.8.4
-    ports:
-      - "7200:7200"
-    volumes:
-      - graphdb-data:/opt/graphdb/home
-      - ../Ontology:/opt/graphdb/home/graphdb-import:ro
-    restart: unless-stopped
-
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6363:6333"
-    volumes:
-      - qdrant-data:/qdrant/storage
-    restart: unless-stopped
-
-volumes:
-  graphdb-data:
-  qdrant-data:

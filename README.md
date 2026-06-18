@@ -4,7 +4,7 @@ The stack has 3 services:
 
 - `backend`: FastAPI backend that calls a custom chat-completions-compatible model API with `requests`, queries GraphDB first, and streams responses at `POST /api/chat`.
 - `frontend`: Svelte/Vite chat UI at `http://localhost:5173`.
-- `graphdb`: Ontotext GraphDB at `http://localhost:7200`, with the `Ontology` folder mounted as the import folder.
+- `graphdb`: Ontotext GraphDB at `http://157.10.53.238:21150`, using repository `DBPEDIA`.
 
 ## Run With Docker Compose
 
@@ -17,7 +17,7 @@ Open:
 
 - Frontend: http://localhost:5173
 - Backend health: http://localhost:8000/health
-- GraphDB: http://localhost:7200
+- GraphDB: http://157.10.53.238:21150
 - Qdrant: http://localhost:6363
 
 ## Build The Ontology URI Index
@@ -53,7 +53,7 @@ CHAT_API_CONNECT_TIMEOUT_SECONDS=10
 CHAT_API_READ_TIMEOUT_SECONDS=120
 CHAT_API_MAX_RETRIES=2
 CHAT_API_RETRY_BACKOFF_SECONDS=1
-GRAPHDB_REPOSITORY=vdt
+GRAPHDB_REPOSITORY=DBPEDIA
 GRAPHDB_QUERY_TIMEOUT_SECONDS=200
 QUESTION_TIMEOUT_SECONDS=1200
 QUESTION_FINALIZATION_RESERVE_SECONDS=240

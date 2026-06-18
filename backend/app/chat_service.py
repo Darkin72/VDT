@@ -48,7 +48,7 @@ def execute_sparql_step(
     graphdb_result = None
     graphdb_error = None
     try:
-        sparql = sparql_agent.generate_sparql(message, query_description)
+        sparql = sparql_agent.generate_sparql(message, query_description, history=history)
         if sparql:
             graphdb_result = graphdb_service.query(sparql, timeout_seconds=graphdb_timeout_seconds)
         else:
