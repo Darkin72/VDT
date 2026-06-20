@@ -88,7 +88,7 @@ def query_retry_delay_seconds() -> float:
     return max(0.0, float(os.getenv("GRAPHDB_QUERY_RETRY_DELAY_SECONDS", "10")))
 
 def is_retryable_graphdb_error(exc: requests.RequestException) -> bool:
-    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+    return isinstance(exc, requests.ConnectionError)
 
 def effective_query_timeout_seconds(
     *,
