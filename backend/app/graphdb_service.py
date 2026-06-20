@@ -117,7 +117,7 @@ def query(sparql: str, *, timeout_seconds: int | None = None) -> dict[str, Any]:
     compact_sparql = sparql_one_line(sparql)
 
     for attempt in range(1, attempts + 1):
-        logging_service.agent_step(
+        logging_service.trace_step(
             "graphdb.query_start",
             {
                 "attempt": attempt,
@@ -125,6 +125,16 @@ def query(sparql: str, *, timeout_seconds: int | None = None) -> dict[str, Any]:
                 "repository_url": repository_url,
                 "timeout_seconds": timeout_seconds,
                 "sparql": compact_sparql,
+            },
+        )
+        logging_service.agent_step(
+            "graphdb.query_start",
+            {
+                "attempt": attempt,
+                "max_attempts": attempts,
+                "repository_url": repository_url,
+                "timeout_seconds": timeout_seconds,
+                "sparql_chars": len(compact_sparql),
             },
         )
         try:

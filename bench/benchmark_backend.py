@@ -48,7 +48,7 @@ class BenchmarkResult:
     correct_answer: int
     predicted_answer: int | None
     is_correct: bool
-    has_db_evidence: bool
+    graphDB_evidence: bool
     valid_answer_count: int
     raw_response: str
     response_json: dict[str, object]
@@ -137,11 +137,11 @@ def build_prompt(case: QuestionCase) -> str:
     return (
         "Bạn là hệ thống trả lời trắc nghiệm tiếng Việt.\n"
         "Chỉ trả về JSON hợp lệ, không giải thích, không markdown, không thêm ký tự khác.\n"
-        "Schema bắt buộc: {\"answer\":\"1\"}.\n"
+        "Required schema: {\"answer\":\"1\",\"graphDB_evidence\":true,\"evidence\":[\"short evidence\"]}.\n"
         f"Giá trị answer hợp lệ là chuỗi từ \"1\" đến \"{len(case.options)}\".\n\n"
         f"Câu hỏi: {case.question}\n\n"
         f"Các đáp án:\n{options_text}\n\n"
-        "If SPARQL/GraphDB evidence is available, choose the option supported by that evidence and return {\"answer\":\"1\",\"evidence\":[\"short evidence\"]}; only guess the most likely option when no usable SPARQL evidence exists.\n"
+        "If SPARQL/GraphDB evidence directly supports the selected option, return graphDB_evidence=true and cite that evidence. If not, return graphDB_evidence=false and explain no usable GraphDB evidence; only guess when required.\n"
         "JSON:"
     )
 
@@ -200,24 +200,16 @@ def extract_answer(raw_response: str, valid_answer_count: int) -> int | None:
     return None
 
 
-def has_db_evidence(raw_response: str) -> bool:
+def graphdb_evidence_from_response(raw_response: str) -> bool:
     data = extract_response_json(raw_response)
-    evidence = data.get("evidence") if data else None
-    if not isinstance(evidence, list):
+    if not data:
         return False
-
-    evidence_text = "\n".join(str(item) for item in evidence).lower()
-    fallback_markers = (
-        "no usable sparql evidence",
-        "best-effort guess",
-        "fallback",
-        "no_graphdb_result",
-        "graphdb_error",
-        "graphdb_timeout",
-    )
-    if any(marker in evidence_text for marker in fallback_markers):
-        return False
-    return bool(evidence_text.strip())
+    value = data.get("graphDB_evidence")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return False
 
 def build_trace_step(step: str, detail: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -231,6 +223,33 @@ def extract_backend_trace(response_json: dict[str, object]) -> list[dict[str, An
     if isinstance(trace, list):
         return [item if isinstance(item, dict) else {"message": str(item)} for item in trace]
     return []
+
+def parse_backend_trace_detail(detail: Any) -> Any:
+    if not isinstance(detail, str):
+        return detail
+    try:
+        return json.loads(detail)
+    except json.JSONDecodeError:
+        return detail
+
+def parsed_backend_trace(response_json: dict[str, object]) -> list[dict[str, Any]]:
+    parsed: list[dict[str, Any]] = []
+    for event in extract_backend_trace(response_json):
+        item = dict(event)
+        if "detail" in item:
+            item["detail"] = parse_backend_trace_detail(item["detail"])
+        parsed.append(item)
+    return parsed
+
+def backend_agent_io(response_json: dict[str, object]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for event in parsed_backend_trace(response_json):
+        step = str(event.get("step", ""))
+        if not step:
+            continue
+        agent = step.split(".", 1)[0]
+        grouped.setdefault(agent, []).append(event)
+    return grouped
 
 
 def strip_backend_trace_from_json(data: dict[str, object]) -> dict[str, object]:
@@ -301,6 +320,8 @@ def run_single_case(
                     "parsed": bool(response_json),
                     "response_json": response_json,
                     "backend_trace_from_response": extract_backend_trace(response_json),
+                    "backend_trace_parsed_from_response": parsed_backend_trace(response_json),
+                    "backend_agent_io_from_response": backend_agent_io(response_json),
                 },
             )
         )
@@ -331,7 +352,7 @@ def run_single_case(
         latency = time.perf_counter() - started_at
 
     is_correct = predicted_answer == case.answer
-    evidence_found = has_db_evidence(raw_response)
+    evidence_found = graphdb_evidence_from_response(raw_response)
     keep_backend_debug = bool(error) or predicted_answer is None or not is_correct or not evidence_found
     if not keep_backend_debug and response_json:
         response_json = strip_backend_trace_from_json(response_json)
@@ -340,6 +361,8 @@ def run_single_case(
             detail = step.get("detail")
             if isinstance(detail, dict) and "backend_trace_from_response" in detail:
                 detail["backend_trace_from_response"] = []
+                detail["backend_trace_parsed_from_response"] = []
+                detail["backend_agent_io_from_response"] = {}
     trace_log.append(
         build_trace_step(
             "benchmark.score",
@@ -347,7 +370,7 @@ def run_single_case(
                 "correct_answer": case.answer,
                 "predicted_answer": predicted_answer,
                 "is_correct": is_correct,
-                "has_db_evidence": evidence_found,
+                "graphDB_evidence": evidence_found,
                 "latency_seconds": round(latency, 4),
                 "error": error,
             },
@@ -360,7 +383,7 @@ def run_single_case(
         correct_answer=case.answer,
         predicted_answer=predicted_answer,
         is_correct=is_correct,
-        has_db_evidence=evidence_found,
+        graphDB_evidence=evidence_found,
         valid_answer_count=len(case.options),
         raw_response=raw_response,
         response_json=response_json,
@@ -372,7 +395,7 @@ def run_single_case(
 
 def print_case_result(index: int, case: QuestionCase, result: BenchmarkResult) -> None:
     status = "ĐÚNG" if result.is_correct else "SAI"
-    evidence_status = "DB" if result.has_db_evidence else "NO_DB_EVIDENCE"
+    evidence_status = "DB" if result.graphDB_evidence else "NO_DB_EVIDENCE"
     predicted_text = "Không trích được" if result.predicted_answer is None else str(result.predicted_answer)
     print(
         f"[{index}] ID={case.question_id} {status} | đúng={case.answer} | "
@@ -440,7 +463,7 @@ def summarize(results: list[BenchmarkResult]) -> dict[str, object]:
     correct = sum(1 for result in results if result.is_correct)
     errored = sum(1 for result in results if result.error)
     unparsed = sum(1 for result in results if result.predicted_answer is None and not result.error)
-    db_evidence_count = sum(1 for result in results if result.has_db_evidence)
+    graphdb_evidence_count = sum(1 for result in results if result.graphDB_evidence)
     accuracy = correct / total if total else 0.0
 
     by_type: dict[str, dict[str, object]] = {}
@@ -459,15 +482,15 @@ def summarize(results: list[BenchmarkResult]) -> dict[str, object]:
         "incorrect": total - correct,
         "errored": errored,
         "unparsed": unparsed,
-        "db_evidence_count": db_evidence_count,
-        "db_evidence_rate": db_evidence_count / total if total else 0.0,
+        "graphDB_evidence_count": graphdb_evidence_count,
+        "graphDB_evidence_rate": graphdb_evidence_count / total if total else 0.0,
         "accuracy": accuracy,
         "by_type": by_type,
     }
 
 
 def needs_debug_log(result: BenchmarkResult) -> bool:
-    return bool(result.error) or result.predicted_answer is None or not result.is_correct or not result.has_db_evidence
+    return bool(result.error) or result.predicted_answer is None or not result.is_correct or not result.graphDB_evidence
 
 
 def debug_record(result: BenchmarkResult) -> dict[str, Any]:
@@ -477,24 +500,24 @@ def debug_record(result: BenchmarkResult) -> dict[str, Any]:
         "correct_answer": result.correct_answer,
         "predicted_answer": result.predicted_answer,
         "is_correct": result.is_correct,
-        "has_db_evidence": result.has_db_evidence,
+        "graphDB_evidence": result.graphDB_evidence,
         "latency_seconds": round(result.latency_seconds, 4),
         "error": result.error,
         "prompt": result.question,
         "raw_response": result.raw_response,
         "response_json": result.response_json,
         "backend_trace": extract_backend_trace(result.response_json),
+        "backend_trace_parsed": parsed_backend_trace(result.response_json),
+        "backend_agent_io": backend_agent_io(result.response_json),
         "benchmark_trace": result.trace_log,
     }
 
 
-def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], output_dir: Path) -> tuple[Path, Path, Path | None]:
+def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], output_dir: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = output_dir / f"benchmark_results_{timestamp}.csv"
     json_path = output_dir / f"benchmark_summary_{timestamp}.json"
-    debug_path = output_dir / f"benchmark_debug_{timestamp}.jsonl"
-
     with csv_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(
             file,
@@ -505,7 +528,7 @@ def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], ou
                 "correct_answer",
                 "predicted_answer",
                 "is_correct",
-                "has_db_evidence",
+                "graphDB_evidence",
                 "valid_answer_count",
                 "latency_seconds",
                 "error",
@@ -522,7 +545,7 @@ def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], ou
                     "correct_answer": result.correct_answer,
                     "predicted_answer": result.predicted_answer or "",
                     "is_correct": result.is_correct,
-                    "has_db_evidence": result.has_db_evidence,
+                    "graphDB_evidence": result.graphDB_evidence,
                     "valid_answer_count": result.valid_answer_count,
                     "latency_seconds": round(result.latency_seconds, 4),
                     "error": result.error,
@@ -538,15 +561,7 @@ def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], ou
     with json_path.open("w", encoding="utf-8") as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
 
-    debug_results = [result for result in results if needs_debug_log(result)]
-    if debug_results:
-        with debug_path.open("w", encoding="utf-8") as file:
-            for result in debug_results:
-                file.write(json.dumps(debug_record(result), ensure_ascii=False) + "\n")
-    else:
-        debug_path = None
-
-    return csv_path, json_path, debug_path
+    return csv_path, json_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -566,7 +581,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Thư mục ghi kết quả")
     parser.add_argument("--fail-fast", action="store_true", help="Dừng ngay khi request đầu tiên bị lỗi")
     parser.add_argument(
-        "--no-stream-echo",
+        "--stream-echo",
         action="store_true",
         help="Không in stream câu trả lời của model ra màn hình trong lúc benchmark",
     )
@@ -613,12 +628,12 @@ def main() -> int:
         timeout=args.timeout,
         delay=args.delay,
         fail_fast=args.fail_fast,
-        echo_stream=not args.no_stream_echo,
+        echo_stream=args.stream_echo,
         concurrency=max(1, args.concurrency),
         backend_debug=not args.no_backend_debug,
     )
     summary = summarize(results)
-    csv_path, json_path, debug_path = write_outputs(results, summary, args.output_dir)
+    csv_path, json_path = write_outputs(results, summary, args.output_dir)
 
     print("\nTổng kết")
     print(f"- Tổng số câu: {summary['total']}")
@@ -626,12 +641,10 @@ def main() -> int:
     print(f"- Sai: {summary['incorrect']}")
     print(f"- Lỗi request: {summary['errored']}")
     print(f"- Không trích được đáp án: {summary['unparsed']}")
-    print(f"- DB evidence extracted: {summary['db_evidence_count']} ({summary['db_evidence_rate']:.2%})")
+    print(f"- GraphDB evidence: {summary['graphDB_evidence_count']} ({summary['graphDB_evidence_rate']:.2%})")
     print(f"- Accuracy: {summary['accuracy']:.2%}")
     print(f"- File CSV: {csv_path}")
     print(f"- File JSON: {json_path}")
-    if debug_path:
-        print(f"- File debug sai/no-evidence: {debug_path}")
     return 0
 
 

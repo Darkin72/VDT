@@ -256,13 +256,18 @@ def plan_subqueries(
         f"Original prompt:\n{message}\n\n"
         f"Available execution context:\n{json.dumps(execution_context_for_llm(history, include_current_round=False), ensure_ascii=False, indent=2)}"
     )
+    logging_service.trace_step(
+        "central_agent.subquery_plan_input",
+        {"round_index": round_index, "focus": fallback_description, "prompt": prompt},
+        limit=20000,
+    )
     raw_text = llm_service.complete_text(
         [
             llm_service.system_message("You are a central query planner. Return only planning JSON."),
             llm_service.user_message(prompt),
         ]
     )
-    logging_service.verbose_text("central_agent.raw_subquery_plan", raw_text)
+    logging_service.trace_text("central_agent.raw_subquery_plan", raw_text, limit=20000)
     data = extract_json_object(raw_text)
     plan = {
         "subqueries": _normalize_subqueries(
@@ -305,13 +310,18 @@ def evaluate_round(
         f"Original prompt:\n{message}\n\n"
         f"Execution context:\n{json.dumps(execution_context_for_llm(history), ensure_ascii=False, indent=2)}"
     )
+    logging_service.trace_step(
+        "central_agent.round_evaluation_input",
+        {"round_index": round_index, "max_rounds": max_rounds, "prompt": prompt},
+        limit=20000,
+    )
     raw_text = llm_service.complete_text(
         [
             llm_service.system_message("You are a central evaluator. Return only decision JSON."),
             llm_service.user_message(prompt),
         ]
     )
-    logging_service.verbose_text("central_agent.raw_round_evaluation", raw_text)
+    logging_service.trace_text("central_agent.raw_round_evaluation", raw_text, limit=20000)
     data = extract_json_object(raw_text)
     action = str(data.get("action", "answer")).strip().lower() if data else "answer"
     if action not in {"answer", "continue"}:
@@ -364,13 +374,18 @@ def decide_next_action(
         f"Original prompt:\n{message}\n\n"
         f"Execution history:\n{history_to_text(history)}"
     )
+    logging_service.trace_step(
+        "central_agent.next_action_input",
+        {"sparql_attempts": sparql_attempts, "max_sparql_attempts": max_sparql_attempts, "prompt": prompt},
+        limit=20000,
+    )
     raw_text = llm_service.complete_text(
         [
             llm_service.system_message("You are a central control agent. Return only action JSON."),
             llm_service.user_message(prompt),
         ]
     )
-    logging_service.verbose_text("central_agent.raw_next_action_response", raw_text)
+    logging_service.trace_text("central_agent.raw_next_action_response", raw_text, limit=20000)
     data = extract_json_object(raw_text)
     action = str(data.get("action", "answer")).strip().lower() if data else "answer"
     if action not in {"answer", "sparql"}:
@@ -406,13 +421,14 @@ def plan_graphdb_usage(message: str) -> dict[str, Any]:
         f"Original prompt:\n{message}\n\n"
         f"Core question without answer options:\n{lookup_prompt}"
     )
+    logging_service.trace_step("central_agent.routing_input", {"prompt": prompt}, limit=20000)
     raw_text = llm_service.complete_text(
         [
             llm_service.system_message("You are a central agent. Return only routing JSON."),
             llm_service.user_message(prompt),
         ]
     )
-    logging_service.verbose_text("central_agent.raw_routing_response", raw_text)
+    logging_service.trace_text("central_agent.raw_routing_response", raw_text, limit=20000)
     data = extract_json_object(raw_text)
     if not data:
         decision = {"use_graphdb": True, "query_description": lookup_prompt, "reason": "routing_json_parse_failed"}
@@ -453,7 +469,9 @@ def normalize_answer_evidence_response(
 
     raw_evidence = data.get("evidence")
     evidence = [str(item).strip() for item in raw_evidence if str(item).strip()] if isinstance(raw_evidence, list) else []
+    graphdb_evidence = parse_bool(data.get("graphDB_evidence")) if data and "graphDB_evidence" in data else bool(evidence)
     if evidence and any(INFERENCE_EVIDENCE_PATTERN.search(item) for item in evidence):
+        graphdb_evidence = False
         if graphdb_error:
             evidence = [f"No usable SPARQL evidence ({graphdb_error}); selected as a best-effort fallback."]
         else:
@@ -461,9 +479,12 @@ def normalize_answer_evidence_response(
     if not evidence:
         if graphdb_result and graphdb_service.has_result(graphdb_result):
             evidence = [f"SPARQL evidence: {graphdb_service.format_result(graphdb_result)}"]
+            graphdb_evidence = True
         elif graphdb_error:
             evidence = [f"No usable SPARQL evidence ({graphdb_error}); selected as a best-effort guess."]
+            graphdb_evidence = False
         else:
             evidence = ["No usable SPARQL evidence; selected as a best-effort guess."]
+            graphdb_evidence = False
 
-    return json.dumps({"answer": answer, "evidence": evidence}, ensure_ascii=False)
+    return json.dumps({"answer": answer, "graphDB_evidence": graphdb_evidence, "evidence": evidence}, ensure_ascii=False)

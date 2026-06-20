@@ -29,13 +29,14 @@ def summarize_round(
         f"Existing accumulated summary:\n{json.dumps(shorten_for_history(accumulated_summary), ensure_ascii=False, indent=2)}\n\n"
         f"Round to fold:\n{json.dumps(compact_round_for_llm(round_data), ensure_ascii=False, indent=2)}"
     )
+    logging_service.trace_step("summary_agent.input", {"prompt": prompt}, limit=20000)
     raw_text = llm_service.complete_text(
         [
             llm_service.system_message("You are a summarization agent. Return only summary JSON."),
             llm_service.user_message(prompt),
         ]
     )
-    logging_service.verbose_text("summary_agent.raw_summary", raw_text)
+    logging_service.trace_text("summary_agent.raw_summary", raw_text, limit=20000)
     data = extract_json_object(raw_text)
     summary = {
         "summary": str(data.get("summary", "")).strip() if data else "",

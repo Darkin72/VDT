@@ -38,7 +38,10 @@ def start_trace() -> tuple[Any, list[dict[str, Any]]]:
 
 
 def stop_trace(token: Any) -> None:
-    _trace_events.reset(token)
+    try:
+        _trace_events.reset(token)
+    except ValueError:
+        _trace_events.set(None)
 
 
 def append_trace_event(step: str, payload: Any, *, limit: int = 3000) -> None:
@@ -53,6 +56,18 @@ def append_trace_event(step: str, payload: Any, *, limit: int = 3000) -> None:
         }
     )
 
+
+
+
+def trace_step(step: str, payload: Any, *, limit: int = 3000) -> None:
+    append_trace_event(step, payload, limit=limit)
+    if AGENT_LOG_VERBOSE:
+        logger.info("%s\n%s", step, _safe_json(payload, limit=limit))
+
+def trace_text(step: str, text: str, *, limit: int = 3000) -> None:
+    append_trace_event(step, text, limit=limit)
+    if AGENT_LOG_VERBOSE:
+        logger.info("%s\n%s", step, _shorten_text(text, limit=limit))
 
 def agent_step(step: str, payload: Any, *, limit: int = 3000) -> None:
     append_trace_event(step, payload, limit=limit)

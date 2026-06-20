@@ -40,6 +40,16 @@ def normalized_final_stream(
 ) -> Iterator[str]:
     graphdb_result, graphdb_error = answer_formatter.latest_graphdb_evidence(history)
     final_text = central.normalize_answer_evidence_response(message, raw_text, graphdb_result, graphdb_error)
+    logging_service.trace_step(
+        "answer_formatter.normalized_output",
+        {
+            "raw_answer": raw_text,
+            "graphdb_evidence_summary": graphdb_service.summarize_result(graphdb_result) if graphdb_result else None,
+            "graphdb_error": graphdb_error,
+            "final_text": final_text,
+        },
+        limit=30000,
+    )
     if debug_trace is not None and central.is_multiple_choice_prompt(message):
         data = central.extract_json_object(final_text)
         if data:
@@ -99,6 +109,11 @@ def execute_subquery_step(
                 )
                 if sparql:
                     graphdb_result = graphdb_service.query(sparql, timeout_seconds=graphdb_timeout_seconds)
+                    logging_service.trace_step(
+                        "graphdb.query_result_compact",
+                        graphdb_service.compact_result(graphdb_result),
+                        limit=30000,
+                    )
                 else:
                     graphdb_error = "SPARQL_GENERATION_EMPTY_OR_REJECTED"
             except requests.Timeout as exc:
@@ -144,7 +159,7 @@ def execute_subquery_step(
         "sparql_attempts": attempts,
     }
     round_data.setdefault("executions", []).append(execution)
-    logging_service.agent_step("agent_pipeline.subquery_execution", central.compact_execution_for_llm(execution), limit=5000)
+    logging_service.trace_step("agent_pipeline.subquery_execution", central.compact_execution_for_llm(execution), limit=5000)
 
 def fold_old_rounds_into_summary(history: dict[str, Any]) -> None:
     rounds = history.get("rounds", [])
@@ -173,7 +188,7 @@ def agent_stream(message: str, *, debug: bool = False) -> Iterator[str]:
         trace_token, debug_trace = logging_service.start_trace()
     try:
         deadline = time.monotonic() + question_timeout_seconds()
-        logging_service.agent_text("user.prompt", message)
+        logging_service.trace_text("user.prompt", message)
         history = central.build_history(message)
         routing_decision = central.plan_graphdb_usage(message)
         central.add_history_step(history, "central_routing", routing_decision)

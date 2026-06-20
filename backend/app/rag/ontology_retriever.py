@@ -220,7 +220,7 @@ def retrieve_candidates_for_terms(terms: list[str], *, source_query: str = "") -
                 if len(candidates) >= top_k():
                     break
         connection.close()
-        logging_service.agent_step(
+        logging_service.trace_step(
             "ontology_lookup.retrieved",
             {
                 "db_path": str(db_path),

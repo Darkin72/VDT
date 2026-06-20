@@ -202,13 +202,18 @@ def generate_ontology_lookup_terms(
         f"Purpose:\n{purpose}\n\n"
         f"Expected evidence:\n{expected_evidence}"
     )
+    logging_service.trace_step(
+        "sparql_agent.ontology_lookup_terms_input",
+        {"subquery_id": subquery_id, "round_context": shorten_for_history(round_context), "prompt": prompt},
+        limit=12000,
+    )
     raw_text = llm_service.complete_text(
         [
             llm_service.system_message("You choose ontology lookup terms. Return only lookup-term JSON."),
             llm_service.user_message(prompt),
         ]
     )
-    logging_service.verbose_text("sparql_agent.raw_ontology_lookup_terms", raw_text)
+    logging_service.trace_text("sparql_agent.raw_ontology_lookup_terms", raw_text, limit=12000)
     data = extract_json_object(raw_text)
     raw_terms = data.get("terms") if isinstance(data, dict) else None
     if not isinstance(raw_terms, list):
@@ -392,13 +397,24 @@ def generate_sparql(
         f"Round context:\n{json.dumps(shorten_for_history(round_context), ensure_ascii=False, indent=2) if round_context else '{}'}\n\n"
         f"Central agent query description:\n{query_description}"
     )
+    logging_service.trace_step(
+        "sparql_agent.generate_input",
+        {
+            "subquery_id": subquery_id,
+            "query_description": query_description,
+            "ontology_lookup_terms": ontology_lookup_terms,
+            "ontology_candidates": ontology_candidates,
+            "prompt": prompt,
+        },
+        limit=30000,
+    )
     raw_text = llm_service.complete_text(
         [
             llm_service.system_message("You are a SPARQL coder. Return only SPARQL JSON."),
             llm_service.user_message(prompt),
         ]
     )
-    logging_service.verbose_text("sparql_agent.raw_response", raw_text)
+    logging_service.trace_text("sparql_agent.raw_response", raw_text, limit=30000)
     data: dict[str, Any] = extract_json_object(raw_text)
     sparql = str(data.get("sparql", "")).strip() if data else ""
     sparql = normalize_escaped_sparql_whitespace(sparql)
@@ -407,8 +423,8 @@ def generate_sparql(
     sparql = normalize_filter_logical_or(sparql)
     sparql = ensure_select_limit(sparql)
     if not is_read_only_sparql(sparql):
-        logging_service.agent_step("sparql_agent.rejected_sparql", {"sparql": sparql})
+        logging_service.trace_step("sparql_agent.rejected_sparql", {"sparql": sparql})
         return ""
-    logging_service.agent_text("sparql_agent.final_sparql", sparql)
+    logging_service.trace_text("sparql_agent.final_sparql", sparql)
     return sparql
 
