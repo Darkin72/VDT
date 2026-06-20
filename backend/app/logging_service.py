@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+from contextvars import ContextVar
+from datetime import datetime
 from typing import Any
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -12,6 +14,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("vdt.agents")
+_trace_events: ContextVar[list[dict[str, Any]] | None] = ContextVar("trace_events", default=None)
 
 
 def _shorten_text(text: str, limit: int = 2000) -> str:
@@ -28,11 +31,36 @@ def _safe_json(value: Any, limit: int = 3000) -> str:
     return _shorten_text(text, limit=limit)
 
 
+def start_trace() -> tuple[Any, list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    token = _trace_events.set(events)
+    return token, events
+
+
+def stop_trace(token: Any) -> None:
+    _trace_events.reset(token)
+
+
+def append_trace_event(step: str, payload: Any, *, limit: int = 3000) -> None:
+    events = _trace_events.get()
+    if events is None:
+        return
+    events.append(
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "step": step,
+            "detail": _safe_json(payload, limit=limit),
+        }
+    )
+
+
 def agent_step(step: str, payload: Any, *, limit: int = 3000) -> None:
+    append_trace_event(step, payload, limit=limit)
     logger.info("%s\n%s", step, _safe_json(payload, limit=limit))
 
 
 def agent_text(step: str, text: str, *, limit: int = 3000) -> None:
+    append_trace_event(step, text, limit=limit)
     logger.info("%s\n%s", step, _shorten_text(text, limit=limit))
 
 

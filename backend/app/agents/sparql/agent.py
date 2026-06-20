@@ -370,6 +370,8 @@ def generate_sparql(
         "If exact predicates such as deathPlace return no rows, try semantically adjacent DBpedia predicates such as restingPlace, placeOfBurial, location, subdivision, country, or other location hierarchy evidence when relevant.\n"
         "Avoid SELECT DISTINCT for broad label scans; use SELECT with LIMIT 100 instead to keep GraphDB memory usage low.\n"
         "For fallback lookup, search across rdfs:label, foaf:name, and dbo:alias, and avoid strict language filters unless the variable is optional evidence only.\n"
+        "Respect entity-type constraints from the wording. If the question asks for ships/tàu, constrain candidates to ship-like resources when possible; for aircraft/máy bay use aircraft-like classes; for cities/thành phố use city/settlement classes and avoid provinces/regions; for universities use university/educational-institution classes; for people/người use person classes. Prefer rdf:type/rdfs:subClassOf* constraints or anchored type verification over label/common-sense matching.\n"
+        "For list, count, comparison, and superlative questions, do not return or compare entities outside the requested class just because their labels look plausible.\n"
         "Do not include answer choices, option IDs, VALUES blocks for choices, or BINDs mapping choices to options. The central agent handles choices later.\n"
         "SPARQL function syntax matters: use CONTAINS(LCASE(STR(?label)), \"text\"), never LCASE(STR(?label)) CONTAINS(\"text\"). Use || for logical OR; never use keyword OR inside FILTER expressions. If combining EXISTS with another boolean condition, put the whole expression inside one FILTER(...); never place || between graph patterns.\n\n"
         "Common prefixes:\n"

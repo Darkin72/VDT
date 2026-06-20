@@ -36,9 +36,15 @@ def normalized_final_stream(
     message: str,
     raw_text: str,
     history: dict[str, Any],
+    debug_trace: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     graphdb_result, graphdb_error = answer_formatter.latest_graphdb_evidence(history)
     final_text = central.normalize_answer_evidence_response(message, raw_text, graphdb_result, graphdb_error)
+    if debug_trace is not None and central.is_multiple_choice_prompt(message):
+        data = central.extract_json_object(final_text)
+        if data:
+            data["backend_trace"] = debug_trace
+            final_text = json.dumps(data, ensure_ascii=False)
     yield final_text.strip()
 
 def _remaining_graphdb_queries(round_index: int, subquery_index: int) -> int:
@@ -160,7 +166,11 @@ def fold_old_rounds_into_summary(history: dict[str, Any]) -> None:
         summarized_count += 1
     history["summarized_round_count"] = summarized_count
 
-def agent_stream(message: str) -> Iterator[str]:
+def agent_stream(message: str, *, debug: bool = False) -> Iterator[str]:
+    trace_token = None
+    debug_trace: list[dict[str, Any]] | None = None
+    if debug:
+        trace_token, debug_trace = logging_service.start_trace()
     try:
         deadline = time.monotonic() + question_timeout_seconds()
         logging_service.agent_text("user.prompt", message)
@@ -207,7 +217,10 @@ def agent_stream(message: str) -> Iterator[str]:
                 fold_old_rounds_into_summary(history)
 
         raw_answer = answer_formatter.format_final_answer(message, history)
-        yield from normalized_final_stream(message, raw_answer, history)
+        yield from normalized_final_stream(message, raw_answer, history, debug_trace)
     except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
         logging_service.logger.exception("agent_pipeline.llm_error")
         yield f"Xin loi, hien tai backend khong goi duoc model API ({type(exc).__name__})."
+    finally:
+        if trace_token is not None:
+            logging_service.stop_trace(trace_token)

@@ -38,7 +38,7 @@ def chat(payload: ChatRequest) -> StreamingResponse:
         raise HTTPException(status_code=500, detail="CHAT_API_BASE_URL is not configured")
 
     return StreamingResponse(
-        chat_service.agent_stream(payload.message),
+        chat_service.agent_stream(payload.message, debug=payload.debug),
         media_type="text/plain; charset=utf-8",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -87,6 +87,9 @@ def query_max_attempts() -> int:
 def query_retry_delay_seconds() -> float:
     return max(0.0, float(os.getenv("GRAPHDB_QUERY_RETRY_DELAY_SECONDS", "10")))
 
+def is_retryable_graphdb_error(exc: requests.RequestException) -> bool:
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
 def effective_query_timeout_seconds(
     *,
     remaining_question_seconds: float | None = None,
@@ -134,28 +137,29 @@ def query(sparql: str, *, timeout_seconds: int | None = None) -> dict[str, Any]:
             try:
                 response.raise_for_status()
             except requests.HTTPError as exc:
+                enriched_error = requests.HTTPError(
+                    f"{exc}; GraphDB response body: {response.text}",
+                    response=response,
+                )
                 logging_service.agent_step(
                     "graphdb.query_error",
                     {
                         "attempt": attempt,
                         "max_attempts": attempts,
-                        "retry": attempt < attempts,
+                        "retry": False,
                         "status_code": response.status_code,
                         "reason": response.reason,
                         "body": response.text,
                     },
                     limit=5000,
                 )
-                raise requests.HTTPError(
-                    f"{exc}; GraphDB response body: {response.text}",
-                    response=response,
-                ) from exc
+                raise enriched_error from exc
 
             result = response.json()
             logging_service.agent_step("graphdb.query_result_summary", summarize_result(result))
             return result
         except requests.RequestException as exc:
-            if attempt >= attempts:
+            if attempt >= attempts or not is_retryable_graphdb_error(exc):
                 raise
             logging_service.agent_step(
                 "graphdb.query_retry",

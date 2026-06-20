@@ -9,6 +9,10 @@ OPTIONS_BLOCK_PATTERN = re.compile(
     "(?is)(?:c(?:a|\u00e1)c\\s+)?(?:(?:\u0111|d)(?:a|\u00e1)p\\s*(?:a|\u00e1)n|answer\\s+options?|options?)\\s*:?\\s*\\n?.*$"
 )
 NUMBERED_OPTION_PATTERN = re.compile(r"(?m)^\s*(?:[1-5]|[A-Ea-e])[\).:-]\s+.+$")
+INFERENCE_EVIDENCE_PATTERN = re.compile(
+    r"(?i)(dựa\s+trên\s+kiến\s+thức\s+chung|common\s+knowledge|best-effort|fallback|"
+    r"guess|suy\s+luận|khả\s+dĩ|phổ\s+biến|probably|likely|plausible)"
+)
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -236,6 +240,8 @@ def plan_subqueries(
         "- Write each subquery description as domain lookup text only, because it is used for ontology term retrieval. Do not put operational words in description such as SPARQL, query, COUNT, COUNT(DISTINCT), total number, perform, execute, aggregate, return, or single integer.\n"
         "- Put execution requirements such as aggregate count, COUNT(DISTINCT ?entity), single integer, samples, or verification only in purpose and expected_evidence, not in description.\n"
         "- Prefer a mix of focused lookup and discovery when predicate choice is uncertain.\n"
+        "- Preserve explicit type constraints from the question in purpose/expected_evidence: ship/tàu -> ship-like resources, aircraft/máy bay -> aircraft-like resources, city/thành phố -> city/settlement resources, university/trường đại học -> university resources, person/người -> person resources.\n"
+        "- If the question asks for a list/count/superlative within a class, require evidence to be filtered to that class; do not allow similarly named but different entity types.\n"
         "- Discovery subqueries should inspect useful non-type predicates and avoid rdf:type/label noise.\n"
         "- For count questions ('bao nhiêu', 'mấy', 'số lượng', 'how many', 'count'), the first subquery must require a numeric aggregate count, not a list of entities. Keep description semantic, e.g. 'Entities typed as dbo:Scientist or subclasses' or 'People with occupation labels scientist researcher scholar'. Put 'Use COUNT(DISTINCT ?entity); expected evidence is one integer' in expected_evidence.\n"
         "- If a count question may match more than 100 entities, expected_evidence must explicitly instruct the SPARQL coder to use COUNT(DISTINCT ...). Do not ask for listing/sample rows first, because LIMIT 100/200 rows is not the total answer.\n"
@@ -289,6 +295,7 @@ def evaluate_round(
         "Decide whether the accumulated evidence is enough to answer, or whether another GraphDB round is needed.\n\n"
         "Important rules:\n"
         "- Choose answer when recent rows or accumulated summary contain concrete evidence for the original question.\n"
+        "- For multiple-choice factual prompts, concrete GraphDB evidence is required to justify an answer. Do not stop only because common knowledge would make one option plausible.\n"
         "- Do not reject evidence only because a predicate is broad, imperfect, or a fallback such as restingPlace for a death-location question; the final answer can qualify it.\n"
         "- Choose continue only when a specific missing piece remains and write next_focus for the next planner.\n"
         "- Avoid repeating failed paths listed in the summary or recent executions.\n"
@@ -341,6 +348,7 @@ def decide_next_action(
         "Decide whether the available information is enough to answer, or whether one more neutral GraphDB lookup is needed.\n\n"
         "Important rules:\n"
         "- If history contains enough concrete evidence or enough failed attempts to make progress unlikely, choose action=answer.\n"
+        "- For multiple-choice factual prompts, answer selection must be based on GraphDB rows/history, not external/common knowledge.\n"
         "- For count questions ('bao nhiêu', 'mấy', 'số lượng'), prefer an aggregate SPARQL result such as COUNT(DISTINCT ?entity) AS ?count. Do not treat row_count from a limited sample as the total.\n"
         "- For count questions, continue if the history only contains limited candidate rows and no aggregate count, unless enough failed attempts make progress unlikely.\n"
         "- Do not mark evidence unusable solely because a relationship predicate is broad or non-standard; note that the final answer can qualify the count.\n"
@@ -445,6 +453,11 @@ def normalize_answer_evidence_response(
 
     raw_evidence = data.get("evidence")
     evidence = [str(item).strip() for item in raw_evidence if str(item).strip()] if isinstance(raw_evidence, list) else []
+    if evidence and any(INFERENCE_EVIDENCE_PATTERN.search(item) for item in evidence):
+        if graphdb_error:
+            evidence = [f"No usable SPARQL evidence ({graphdb_error}); selected as a best-effort fallback."]
+        else:
+            evidence = ["No usable SPARQL evidence; selected as a best-effort fallback."]
     if not evidence:
         if graphdb_result and graphdb_service.has_result(graphdb_result):
             evidence = [f"SPARQL evidence: {graphdb_service.format_result(graphdb_result)}"]

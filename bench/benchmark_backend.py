@@ -146,10 +146,10 @@ def build_prompt(case: QuestionCase) -> str:
     )
 
 
-def call_backend(backend_url: str, prompt: str, timeout: float, echo_stream: bool = True) -> str:
+def call_backend(backend_url: str, prompt: str, timeout: float, echo_stream: bool = True, debug: bool = False) -> str:
     with requests.post(
         backend_url,
-        json={"message": prompt},
+        json={"message": prompt, "debug": debug},
         stream=True,
         timeout=(10, timeout),
     ) as response:
@@ -233,6 +233,14 @@ def extract_backend_trace(response_json: dict[str, object]) -> list[dict[str, An
     return []
 
 
+def strip_backend_trace_from_json(data: dict[str, object]) -> dict[str, object]:
+    stripped = dict(data)
+    stripped.pop("backend_trace", None)
+    stripped.pop("trace_log", None)
+    stripped.pop("trace", None)
+    return stripped
+
+
 def run_single_case(
     index: int,
     case: QuestionCase,
@@ -240,6 +248,7 @@ def run_single_case(
     timeout: float,
     fail_fast: bool,
     echo_stream: bool,
+    backend_debug: bool,
 ) -> tuple[int, BenchmarkResult]:
     prompt = build_prompt(case)
     trace_log: list[dict[str, Any]] = [
@@ -260,7 +269,7 @@ def run_single_case(
             {
                 "method": "POST",
                 "url": backend_url,
-                "json": {"message": prompt},
+                "json": {"message": prompt, "debug": backend_debug},
                 "timeout_seconds": timeout,
             },
         ),
@@ -274,7 +283,7 @@ def run_single_case(
     try:
         if echo_stream:
             print(f"    Model stream [{index}]: ", end="", flush=True)
-        raw_response = call_backend(backend_url, prompt, timeout, echo_stream=echo_stream)
+        raw_response = call_backend(backend_url, prompt, timeout, echo_stream=echo_stream, debug=backend_debug)
         trace_log.append(
             build_trace_step(
                 "backend.response_stream",
@@ -323,6 +332,14 @@ def run_single_case(
 
     is_correct = predicted_answer == case.answer
     evidence_found = has_db_evidence(raw_response)
+    keep_backend_debug = bool(error) or predicted_answer is None or not is_correct or not evidence_found
+    if not keep_backend_debug and response_json:
+        response_json = strip_backend_trace_from_json(response_json)
+        raw_response = json.dumps(response_json, ensure_ascii=False)
+        for step in trace_log:
+            detail = step.get("detail")
+            if isinstance(detail, dict) and "backend_trace_from_response" in detail:
+                detail["backend_trace_from_response"] = []
     trace_log.append(
         build_trace_step(
             "benchmark.score",
@@ -355,10 +372,11 @@ def run_single_case(
 
 def print_case_result(index: int, case: QuestionCase, result: BenchmarkResult) -> None:
     status = "ĐÚNG" if result.is_correct else "SAI"
+    evidence_status = "DB" if result.has_db_evidence else "NO_DB_EVIDENCE"
     predicted_text = "Không trích được" if result.predicted_answer is None else str(result.predicted_answer)
     print(
         f"[{index}] ID={case.question_id} {status} | đúng={case.answer} | "
-        f"model={predicted_text} | {result.latency_seconds:.2f}s"
+        f"model={predicted_text} | {evidence_status} | {result.latency_seconds:.2f}s"
     )
     if result.error:
         print(f"    Lỗi: {result.error}")
@@ -372,13 +390,14 @@ def run_benchmark(
     fail_fast: bool,
     echo_stream: bool,
     concurrency: int,
+    backend_debug: bool,
 ) -> list[BenchmarkResult]:
     indexed_cases = list(enumerate(cases, start=1))
     if concurrency <= 1:
         results: list[BenchmarkResult] = []
         progress = tqdm(indexed_cases, total=len(indexed_cases), desc="Benchmark", unit="q")
         for index, case in progress:
-            _, result = run_single_case(index, case, backend_url, timeout, fail_fast, echo_stream)
+            _, result = run_single_case(index, case, backend_url, timeout, fail_fast, echo_stream, backend_debug)
             results.append(result)
             print_case_result(index, case, result)
             if delay > 0:
@@ -403,6 +422,7 @@ def run_benchmark(
                 timeout,
                 fail_fast,
                 echo_stream,
+                backend_debug,
             )
             future_to_case[future] = (index, case)
 
@@ -446,11 +466,34 @@ def summarize(results: list[BenchmarkResult]) -> dict[str, object]:
     }
 
 
-def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], output_dir: Path) -> tuple[Path, Path]:
+def needs_debug_log(result: BenchmarkResult) -> bool:
+    return bool(result.error) or result.predicted_answer is None or not result.is_correct or not result.has_db_evidence
+
+
+def debug_record(result: BenchmarkResult) -> dict[str, Any]:
+    return {
+        "question_id": result.question_id,
+        "question_type": result.question_type,
+        "correct_answer": result.correct_answer,
+        "predicted_answer": result.predicted_answer,
+        "is_correct": result.is_correct,
+        "has_db_evidence": result.has_db_evidence,
+        "latency_seconds": round(result.latency_seconds, 4),
+        "error": result.error,
+        "prompt": result.question,
+        "raw_response": result.raw_response,
+        "response_json": result.response_json,
+        "backend_trace": extract_backend_trace(result.response_json),
+        "benchmark_trace": result.trace_log,
+    }
+
+
+def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], output_dir: Path) -> tuple[Path, Path, Path | None]:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = output_dir / f"benchmark_results_{timestamp}.csv"
     json_path = output_dir / f"benchmark_summary_{timestamp}.json"
+    debug_path = output_dir / f"benchmark_debug_{timestamp}.jsonl"
 
     with csv_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(
@@ -495,7 +538,15 @@ def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], ou
     with json_path.open("w", encoding="utf-8") as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
 
-    return csv_path, json_path
+    debug_results = [result for result in results if needs_debug_log(result)]
+    if debug_results:
+        with debug_path.open("w", encoding="utf-8") as file:
+            for result in debug_results:
+                file.write(json.dumps(debug_record(result), ensure_ascii=False) + "\n")
+    else:
+        debug_path = None
+
+    return csv_path, json_path, debug_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -504,6 +555,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL, help="Endpoint backend /api/chat")
     parser.add_argument("--limit", type=int, default=0, help="Giới hạn số câu hỏi, 0 là chạy toàn bộ")
     parser.add_argument("--offset", type=int, default=0, help="Bỏ qua N câu hỏi đầu tiên")
+    parser.add_argument(
+        "--ids",
+        default="",
+        help="Danh sách question_id cần chạy, phân tách bằng dấu phẩy hoặc khoảng trắng, ví dụ: --ids 15,17,21",
+    )
     parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout đọc stream cho mỗi câu, tính bằng giây")
     parser.add_argument("--delay", type=float, default=0.0, help="Nghỉ giữa các request submit, tính bằng giây")
     parser.add_argument("--concurrency", type=int, default=1, help="Số câu benchmark chạy song song")
@@ -513,6 +569,11 @@ def parse_args() -> argparse.Namespace:
         "--no-stream-echo",
         action="store_true",
         help="Không in stream câu trả lời của model ra màn hình trong lúc benchmark",
+    )
+    parser.add_argument(
+        "--no-backend-debug",
+        action="store_true",
+        help="Không yêu cầu backend trả backend_trace chi tiết trong response",
     )
     return parser.parse_args()
 
@@ -524,6 +585,14 @@ def main() -> int:
 
     args = parse_args()
     cases = load_questions(args.xlsx)
+    if args.ids.strip():
+        requested_ids = [item for item in re.split(r"[\s,]+", args.ids.strip()) if item]
+        requested_id_set = set(requested_ids)
+        cases = [case for case in cases if case.question_id in requested_id_set]
+        found_ids = {case.question_id for case in cases}
+        missing_ids = [question_id for question_id in requested_ids if question_id not in found_ids]
+        if missing_ids:
+            print(f"Không tìm thấy question_id: {', '.join(missing_ids)}", file=sys.stderr)
     if args.offset:
         cases = cases[args.offset :]
     if args.limit:
@@ -546,9 +615,10 @@ def main() -> int:
         fail_fast=args.fail_fast,
         echo_stream=not args.no_stream_echo,
         concurrency=max(1, args.concurrency),
+        backend_debug=not args.no_backend_debug,
     )
     summary = summarize(results)
-    csv_path, json_path = write_outputs(results, summary, args.output_dir)
+    csv_path, json_path, debug_path = write_outputs(results, summary, args.output_dir)
 
     print("\nTổng kết")
     print(f"- Tổng số câu: {summary['total']}")
@@ -560,6 +630,8 @@ def main() -> int:
     print(f"- Accuracy: {summary['accuracy']:.2%}")
     print(f"- File CSV: {csv_path}")
     print(f"- File JSON: {json_path}")
+    if debug_path:
+        print(f"- File debug sai/no-evidence: {debug_path}")
     return 0
 
 
